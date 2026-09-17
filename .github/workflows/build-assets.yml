@@ -1,0 +1,87 @@
+name: Build and publish City V2 assets
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'assets-source/**'
+      - 'tools/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/build-assets.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: city-v2-assets-production
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      ASSET_PUBLIC_BASE_URL: ${{ vars.ASSET_PUBLIC_BASE_URL }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
+    steps:
+      - name: Checkout asset repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install image-build dependencies
+        run: npm install
+
+      - name: Validate required deployment settings
+        shell: bash
+        run: |
+          test -n "$ASSET_PUBLIC_BASE_URL"
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$R2_ACCOUNT_ID"
+          test -n "$R2_BUCKET"
+
+      - name: Build responsive WebP assets and manifest
+        run: npm run assets:build
+
+      - name: Install AWS CLI
+        run: python -m pip install --disable-pip-version-check awscli
+
+      - name: Upload immutable versioned images
+        shell: bash
+        run: |
+          aws s3 sync generated/v1 "s3://$R2_BUCKET/v1" \
+            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" \
+            --exclude "*" \
+            --include "*.webp" \
+            --cache-control "public,max-age=31536000,immutable" \
+            --content-type "image/webp" \
+            --delete
+
+      - name: Upload short-cache manifest last
+        shell: bash
+        run: |
+          aws s3 cp generated/v1/asset-manifest.json \
+            "s3://$R2_BUCKET/v1/asset-manifest.json" \
+            --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" \
+            --cache-control "public,max-age=60,must-revalidate" \
+            --content-type "application/json"
+
+      - name: Keep build report for debugging
+        uses: actions/upload-artifact@v4
+        with:
+          name: city-v2-generated-assets
+          path: generated/v1
+          retention-days: 7

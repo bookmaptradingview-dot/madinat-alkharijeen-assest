@@ -1,1 +1,13 @@
-
+{
+  "name": "city-v2-assets",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "assets:build": "node tools/build-assets.mjs",
+    "assets:check": "node tools/build-assets.mjs --check"
+  },
+  "devDependencies": {
+    "sharp": "^0.34.4"
+  }
+}

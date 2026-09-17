@@ -1,0 +1,185 @@
+// =====================================================
+// CITY V2 — EXTERNAL ASSET BUILDER V1
+// =====================================================
+
+import { createHash } from 'node:crypto'
+import { promises as fs } from 'node:fs'
+import path from 'node:path'
+import sharp from 'sharp'
+import { ASSET_PIPELINE_CONFIG as config } from './asset-pipeline.config.mjs'
+
+const root = process.cwd()
+const sourceRoot = path.resolve(root, config.sourceDirectory)
+const outputRoot = path.resolve(root, config.outputDirectory)
+const manifestPath = path.resolve(root, config.manifestFile)
+const checkOnly = process.argv.includes('--check')
+
+function slash(value) {
+  return value.split(path.sep).join('/')
+}
+
+function assetId(relativePath) {
+  return slash(relativePath)
+    .replace(/\.[^.]+$/, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9/_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-/]+|[-/]+$/g, '')
+}
+
+function contentHash(buffer) {
+  return createHash('sha256').update(buffer).digest('hex').slice(0, 10)
+}
+
+async function walk(directory) {
+  const entries = await fs.readdir(directory, { withFileTypes: true })
+  const files = []
+
+  for (const entry of entries) {
+    const absolute = path.join(directory, entry.name)
+    if (entry.isDirectory()) files.push(...await walk(absolute))
+    else files.push(absolute)
+  }
+
+  return files
+}
+
+function selectRule(relativePath) {
+  return config.rules.find(rule => rule.match.test(relativePath))
+}
+
+function publicUrl(relativeOutputPath) {
+  return `${config.publicBaseUrl}/${slash(relativeOutputPath)}`
+}
+
+async function ensureSourceDirectory() {
+  try {
+    await fs.access(sourceRoot)
+  } catch {
+    throw new Error(`Missing source directory: ${config.sourceDirectory}`)
+  }
+}
+
+async function buildOne(absoluteInput) {
+  const relativeInput = slash(path.relative(sourceRoot, absoluteInput))
+  const id = assetId(relativeInput)
+  const rule = selectRule(relativeInput)
+  const originalBuffer = await fs.readFile(absoluteInput)
+  const hash = contentHash(originalBuffer)
+  const metadata = await sharp(originalBuffer).metadata()
+  const variants = {}
+  const warnings = []
+
+  for (const size of rule.sizes) {
+    const filename = `${path.posix.basename(id)}.${hash}.${size}.webp`
+    const outputRelative = `${id}/${filename}`
+    const outputAbsolute = path.join(outputRoot, outputRelative)
+
+    const transformed = await sharp(originalBuffer, { failOn: 'warning' })
+      .rotate()
+      .resize({
+        width: size,
+        height: size,
+        fit: 'inside',
+        withoutEnlargement: true
+      })
+      .webp({ quality: rule.quality, alphaQuality: 90, effort: 5 })
+      .toBuffer()
+
+    const limit = Number(rule.maxBytes?.[size] || 0)
+    if (limit > 0 && transformed.length > limit) {
+      warnings.push(`${size}px is ${transformed.length} bytes; budget is ${limit}`)
+    }
+
+    if (!checkOnly) {
+      await fs.mkdir(path.dirname(outputAbsolute), { recursive: true })
+      await fs.writeFile(outputAbsolute, transformed)
+    }
+
+    variants[size] = {
+      url: publicUrl(outputRelative),
+      width: Math.min(size, metadata.width || size),
+      height: Math.min(size, metadata.height || size),
+      bytes: transformed.length,
+      format: 'webp'
+    }
+  }
+
+  return {
+    id,
+    source: relativeInput,
+    kind: rule.name,
+    version: hash,
+    original: {
+      width: metadata.width || null,
+      height: metadata.height || null,
+      format: metadata.format || null,
+      bytes: originalBuffer.length,
+      hasAlpha: Boolean(metadata.hasAlpha)
+    },
+    variants,
+    warnings
+  }
+}
+
+async function main() {
+  await ensureSourceDirectory()
+
+  const files = (await walk(sourceRoot))
+    .filter(file => config.supportedExtensions.includes(path.extname(file).toLowerCase()))
+    .sort()
+
+  if (!files.length) throw new Error('No supported source images found')
+
+  if (!checkOnly) {
+    await fs.rm(outputRoot, { recursive: true, force: true })
+    await fs.mkdir(outputRoot, { recursive: true })
+  }
+
+  const assets = {}
+  let warningCount = 0
+  let originalBytes = 0
+  let generatedBytes = 0
+
+  for (const file of files) {
+    const asset = await buildOne(file)
+    if (!asset.id) throw new Error(`Invalid asset id for ${asset.source}`)
+    if (assets[asset.id]) throw new Error(`Duplicate asset id: ${asset.id}`)
+
+    assets[asset.id] = asset
+    warningCount += asset.warnings.length
+    originalBytes += asset.original.bytes
+    generatedBytes += Object.values(asset.variants)
+      .reduce((sum, item) => sum + item.bytes, 0)
+  }
+
+  const manifest = {
+    schemaVersion: config.version,
+    generatedAt: new Date().toISOString(),
+    assetCount: Object.keys(assets).length,
+    assets
+  }
+
+  if (!checkOnly) {
+    await fs.mkdir(path.dirname(manifestPath), { recursive: true })
+    await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+  }
+
+  console.log(`CITY V2 assets: ${files.length}`)
+  console.log(`Original bytes: ${originalBytes}`)
+  console.log(`Generated bytes: ${generatedBytes}`)
+  console.log(`Budget warnings: ${warningCount}`)
+
+  Object.values(assets).forEach(asset => {
+    asset.warnings.forEach(warning => {
+      console.warn(`- ${asset.id}: ${warning}`)
+    })
+  })
+
+  if (warningCount > 0) process.exitCode = 2
+}
+
+main().catch(error => {
+  console.error(`CITY V2 asset build failed: ${error.message}`)
+  process.exitCode = 1
+})
